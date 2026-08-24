@@ -1,0 +1,511 @@
+# Python Script, API Version = V252
+"""
+===============================================================================
+ANSYS SPACECLAIM CFD ENCLOSURE & NAMED SELECTIONS AUTOMATION
+EXPORT DUAL: SCDOCX (BACKUP) & FMD (MALLADO)
+===============================================================================
+
+SECUENCIA DE EJECUCIÓN:
+PASO 1: Carga de geometría STEP y creación de bloques fluidos (Outer, Middle, Inner).
+PASO 2: Operaciones booleanas destructivas (sustracción de cavidades y eliminación del ala sólida).
+PASO 3: Asignación de Topología Compartida (Propiedad Share + ShareTopology.FindAndFix).
+PASO 4: Purga total de grupos antiguos y creación de Named Selections sobre la topología viva.
+PASO 5: Guardado de respaldo en .scdocx, exportación a .fmd y generación del contrato XML.
+===============================================================================
+"""
+
+import os
+import math
+import xml.etree.ElementTree as ET
+
+# ==============================================================================
+# CONFIGURACIÓN Y PUENTE XML
+# ==============================================================================
+
+XML_INPUT_PATH = r"C:\Users\victo\UAV_Project\ALACHIKITA\wing_parameters.xml"
+
+# ==============================================================================
+# FUNCIONES AUXILIARES
+# ==============================================================================
+
+def parse_wing_parameters_xml(xml_path):
+    """Extrae parámetros geométricos y rutas desde el XML de entrada."""
+    if not os.path.exists(xml_path):
+        raise FileNotFoundError("Archivo XML no encontrado en: " + str(xml_path))
+    
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    
+    config = {}
+    config['step_path'] = root.find("FilePaths/StepFilePath").text
+    config['mac'] = float(root.find("AerodynamicParameters/MAC").text)
+    config['semi_span'] = float(root.find("BoundingBox/YMax").text)
+    
+    return config
+
+def export_meshing_contract_xml(output_xml_path, scdocx_path, mac, semi_span, ns_summary):
+    """Genera el contrato XML para Fluent Meshing registrando la ruta al archivo .scdocx."""
+    root = ET.Element("MeshingContract")
+    
+    files_node = ET.SubElement(root, "SourceFiles")
+    ET.SubElement(files_node, "GeometryFilePath").text = str(scdocx_path)
+    
+    geo_node = ET.SubElement(root, "GeometricReference")
+    ET.SubElement(geo_node, "MAC").text = str(mac)
+    ET.SubElement(geo_node, "SemiSpan").text = str(semi_span)
+    
+    ns_node = ET.SubElement(root, "NamedSelections")
+    for name, count in ns_summary.items():
+        sel = ET.SubElement(ns_node, "Selection")
+        sel.set("name", str(name))
+        sel.set("entity_count", str(count))
+        
+    sizing_node = ET.SubElement(root, "RecommendedSizing")
+    ET.SubElement(sizing_node, "TargetYPlus").text = "1.0"
+    ET.SubElement(sizing_node, "WingMinElementSize").text = str(round(mac * 0.001, 6))
+    ET.SubElement(sizing_node, "WingMaxElementSize").text = str(round(mac * 0.015, 6))
+    ET.SubElement(sizing_node, "InnerDomainMaxMesh").text = str(round(mac * 0.1, 4))
+    ET.SubElement(sizing_node, "OuterDomainMaxMesh").text = str(round(mac * 1.0, 4))
+    
+    tree = ET.ElementTree(root)
+    tree.write(output_xml_path, encoding="utf-8", xml_declaration=True)
+    print("  [OK] Contrato XML de mallado generado: " + str(output_xml_path))
+
+def get_active_root_part():
+    """Obtiene el RootPart activo de forma segura."""
+    try:
+        part = GetRootPart()
+        if part is not None:
+            return part
+    except Exception:
+        pass
+    try:
+        if Window.ActiveWindow is not None and Window.ActiveWindow.Document is not None:
+            return Window.ActiveWindow.Document.RootPart
+    except Exception:
+        pass
+    return None
+
+def purge_all_groups_and_selections(part_root):
+    """Purga todos los grupos y Named Selections existentes en el documento."""
+    doc = part_root.Document
+    objects_to_delete = []
+
+    for container in [doc, part_root]:
+        if hasattr(container, 'Groups'):
+            try:
+                objects_to_delete.extend(list(container.Groups))
+            except Exception:
+                pass
+
+    try:
+        if Window.ActiveWindow is not None and hasattr(Window.ActiveWindow, 'Groups'):
+            objects_to_delete.extend(list(Window.ActiveWindow.Groups))
+    except Exception:
+        pass
+
+    for item in [doc, part_root]:
+        try:
+            objects_to_delete.extend(list(NamedSelection.GetNamedSelections(item)))
+        except Exception:
+            pass
+
+    unique_objects = []
+    for obj in objects_to_delete:
+        if obj not in unique_objects:
+            unique_objects.append(obj)
+
+    purged_count = 0
+    for obj in unique_objects:
+        deleted = False
+        deletion_methods = [
+            lambda: obj.Delete(),
+            lambda: doc.Groups.Remove(obj),
+            lambda: part_root.Groups.Remove(obj),
+            lambda: NamedSelection.Delete(obj)
+        ]
+        for method in deletion_methods:
+            try:
+                method()
+                deleted = True
+                break
+            except Exception:
+                continue
+        if deleted:
+            purged_count += 1
+
+    print("  [OK] Purga de grupos completada (" + str(purged_count) + " elementos eliminados).")
+
+def get_entity_bounds(entity, is_face=False):
+    """Calcula los límites BoundingBox (min/max) de una entidad geométrica."""
+    if entity is None:
+        return None
+
+    box = None
+    try:
+        box = entity.GetBoundingBox(Matrix.Identity)
+    except Exception:
+        try:
+            box = entity.Shape.GetBoundingBox(Matrix.Identity)
+        except Exception:
+            pass
+
+    if box is not None:
+        try:
+            return (box.X.Min, box.X.Max, box.Y.Min, box.Y.Max, box.Z.Min, box.Z.Max)
+        except AttributeError:
+            pass
+        try:
+            return (box.MinCorner.X, box.MaxCorner.X, box.MinCorner.Y, box.MaxCorner.Y, box.MinCorner.Z, box.MaxCorner.Z)
+        except AttributeError:
+            pass
+        try:
+            return (box.Min.X, box.Max.X, box.Min.Y, box.Max.Y, box.Min.Z, box.Max.Z)
+        except AttributeError:
+            pass
+
+    xs, ys, zs = [], [], []
+    try:
+        shape = entity.Shape if hasattr(entity, 'Shape') else entity
+        vertices = shape.Vertices if hasattr(shape, 'Vertices') else []
+        for v in vertices:
+            p = v.Position if hasattr(v, 'Position') else v.Geometry.Point
+            xs.append(p.X)
+            ys.append(p.Y)
+            zs.append(p.Z)
+        if len(xs) > 0:
+            return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+    except Exception:
+        pass
+
+    return None
+
+def create_domain_block(bounds_dict, block_name, part_root):
+    """Crea un bloque 3D para dominio fluido."""
+    doc = part_root.Document
+    sub_part = Part.Create(doc, block_name)
+    comp = Component.Create(part_root, sub_part)
+    comp.Name = block_name
+
+    p_min = Point.Create(bounds_dict['xmin'], bounds_dict['ymin'], bounds_dict['zmin'])
+    p_max = Point.Create(bounds_dict['xmax'], bounds_dict['ymax'], bounds_dict['zmax'])
+
+    result = BlockBody.Create(p_min, p_max, ExtrudeType.ForceIndependent)
+
+    if result and len(result.CreatedBodies) > 0:
+        solid_body = result.CreatedBodies[0]
+        solid_body.Name = block_name
+        ComponentHelper.MoveBodiesToComponent(
+            Selection.Create(solid_body), comp
+        )
+
+        moved_body = None
+        if len(sub_part.Bodies) > 0:
+            moved_body = sub_part.Bodies[0]
+        elif len(comp.Template.Bodies) > 0:
+            moved_body = comp.Template.Bodies[0]
+
+        if moved_body is not None:
+            moved_body.Name = block_name
+            print("  [OK] Dominio creado: '" + str(block_name) + "'")
+            return moved_body
+
+    print("  [ERROR] Fallo al crear dominio: '" + str(block_name) + "'")
+    return None
+
+def create_named_selection_group(group_name, entity_list):
+    """Instancia Named Selections utilizando Selection.Create() y NamedSelection.Create()."""
+    valid_entities = [e for e in entity_list if e is not None]
+    if len(valid_entities) == 0:
+        print("  [WARNING] Sin entidades válidas para el grupo: '" + str(group_name) + "'")
+        return
+    
+    selection = Selection.Create(valid_entities)
+    ns = NamedSelection.Create(selection, Selection.Empty())
+    if ns and ns.CreatedNamedSelection:
+        ns.CreatedNamedSelection.Name = group_name
+    print("  [OK] Named Selection creada: '" + str(group_name) + "' (" + str(len(valid_entities)) + " entidades)")
+
+def execute_boolean_subtraction(target_body, tool_body):
+    """Ejecuta sustracción booleana (Target - Tool) manteniendo el cortador intacto."""
+    if target_body is None or tool_body is None:
+        return False
+        
+    try:
+        sel_target = Selection.Create(target_body)
+        sel_tool = Selection.Create(tool_body)
+        
+        options = MakeSolidsOptions()
+        options.KeepCutter = True 
+        
+        result = Combine.Intersect(sel_target, sel_tool, options)
+        
+        if result and hasattr(result, 'CreatedBodies'):
+            for b in result.CreatedBodies:
+                try:
+                    b.Delete()
+                except Exception:
+                    pass
+                    
+        print("  [OK] Cavidad sustraída con éxito en '" + target_body.Name + "'.")
+        return True
+    except Exception as e:
+        print("  [ERROR] Fallo en operación booleana sobre '" + target_body.Name + "': " + str(e))
+        return False
+
+# ==============================================================================
+# FLUJO PRINCIPAL DE EJECUCIÓN
+# ==============================================================================
+
+try:
+    print("=== ANSYS SPACECLAIM CFD AUTOMATION (EXPORTACIÓN DUAL SCDOCX / FMD) ===")
+    
+    # Carga de parámetros e inicialización de rutas
+    print("\n[INFO] Leyendo parámetros desde XML...")
+    xml_params = parse_wing_parameters_xml(XML_INPUT_PATH)
+    
+    STEP_INPUT_PATH = xml_params['step_path']
+    MAC_LENGTH = xml_params['mac']
+    SEMI_SPAN = xml_params['semi_span']
+
+    output_folder = os.path.dirname(os.path.abspath(XML_INPUT_PATH))
+    SCDOCX_OUTPUT_PATH = os.path.join(output_folder, "Enclosure_CFD.scdocx")
+    FMD_OUTPUT_PATH = os.path.join(output_folder, "Enclosure_CFD.fmd")
+    CONTRACT_XML_PATH = os.path.join(output_folder, "meshing_contract.xml")
+
+    # Importación de CAD STEP
+    print("\n[INFO] Importando geometría CAD STEP...")
+    DocumentOpen.Execute(STEP_INPUT_PATH)
+    root_part = get_active_root_part()
+
+    if root_part is None:
+        raise RuntimeError("[CRITICAL ERROR] No se pudo acceder al RootPart del documento.")
+
+    # --------------------------------------------------------------------------
+    # PASO 1: GENERAR GEOMETRÍAS Y DOMINIOS FLUIDOS
+    # --------------------------------------------------------------------------
+    print("\n[PASO 1] Generando geometrías y dominios fluidos (Outer, Middle, Inner)...")
+    
+    initial_bodies = root_part.GetAllBodies()
+    try:
+        StitchFaces.FindAndFix(Selection.Create(initial_bodies))
+        MissingFaces.FindAndFix(Selection.Create(root_part.GetAllBodies()))
+    except Exception:
+        pass
+
+    cuerpos_iniciales = root_part.GetAllBodies()
+    if len(cuerpos_iniciales) == 0:
+        raise RuntimeError("[CRITICAL ERROR] No se detectó cuerpo sólido tras la importación.")
+
+    wing_body = cuerpos_iniciales[0]
+    wing_body.Name = "Main_Wing"
+
+    # Cálculo de dimensiones paramétricas
+    length_ext, height_ext, width_ext = MAC_LENGTH * 25.0, MAC_LENGTH * 15.0, SEMI_SPAN * 4.0
+    outer_box_params = {
+        "xmin": -0.25 * length_ext, "xmax": 0.75 * length_ext,
+        "ymin": 0.0, "ymax": width_ext,
+        "zmin": -height_ext / 2.0, "zmax": height_ext / 2.0,
+    }
+
+    length_med, height_med, width_med = MAC_LENGTH * 15.0, MAC_LENGTH * 9.0, SEMI_SPAN * 2.5
+    middle_box_params = {
+        "xmin": -0.2 * length_med, "xmax": 0.8 * length_med,
+        "ymin": 0.0, "ymax": width_med,
+        "zmin": -height_med / 2.0, "zmax": height_med / 2.0,
+    }
+
+    length_int, height_int, width_int = MAC_LENGTH * 10.0, MAC_LENGTH * 5.0, SEMI_SPAN * 1.8
+    inner_box_params = {
+        "xmin": -0.2 * length_int, "xmax": 0.8 * length_int,
+        "ymin": 0.0, "ymax": width_int,
+        "zmin": -height_int / 2.0, "zmax": height_int / 2.0,
+    }
+
+    outer_domain = create_domain_block(outer_box_params, "Outer_Domain", root_part)
+    middle_domain = create_domain_block(middle_box_params, "Middle_Domain", root_part)
+    inner_domain = create_domain_block(inner_box_params, "Inner_Domain", root_part)
+
+    # --------------------------------------------------------------------------
+    # PASO 2: OPERACIONES BOOLEANAS Y ELIMINACIÓN DEL ALA SÓLIDA
+    # --------------------------------------------------------------------------
+    print("\n[PASO 2] Ejecutando operaciones booleanas destructivas...")
+    
+    if outer_domain is not None and middle_domain is not None:
+        execute_boolean_subtraction(outer_domain, middle_domain)
+        
+    if middle_domain is not None and inner_domain is not None:
+        execute_boolean_subtraction(middle_domain, inner_domain)
+        
+    if inner_domain is not None and wing_body is not None:
+        execute_boolean_subtraction(inner_domain, wing_body)
+
+        print("  [INFO] Eliminando la geometría sólida del ala...")
+        try:
+            wing_parent = wing_body.Parent if hasattr(wing_body, 'Parent') else None
+            wing_body.Delete()
+            if wing_parent is not None and wing_parent.Name == "Main_Wing":
+                try: 
+                    wing_parent.Delete() 
+                except Exception: 
+                    pass
+            print("  [OK] Ala sólida eliminada con éxito. Solo permanecen dominios fluidos.")
+        except Exception as e:
+            print("  [WARNING] No se pudo eliminar el ala sólida: " + str(e))
+
+    # --------------------------------------------------------------------------
+    # PASO 3: APLICAR TOPOLOGÍA COMPARTIDA (SHARE TOPOLOGY)
+    # --------------------------------------------------------------------------
+    print("\n[PASO 3] Ejecutando Share Topology para unir interfaces de dominios...")
+    
+    # 3.1 Asignar propiedad a los componentes del árbol
+    try:
+        components = root_part.GetComponents() if hasattr(root_part, 'GetComponents') else root_part.Components
+        for comp in components:
+            try: comp.ShareType = PartShareType.Share
+            except Exception:
+                try: comp.ShareType = ShareType.Share
+                except Exception: pass
+        print("  [OK] Propiedad 'ShareType = Share' asignada a los componentes.")
+    except Exception as error:
+        print("  [WARNING] Alerta al asignar propiedad ShareType: " + str(error))
+
+    # 3.2 Ejecutar herramienta nativa FindAndFix (Impresión geométrica)
+    try:
+        options = ShareTopologyOptions()
+        options.Tolerance = MM(0.2)  # Tolerancia estándar de SpaceClaim (0.2 mm)
+        result = ShareTopology.FindAndFix(options)
+        print("  [OK] Herramienta nativa 'ShareTopology.FindAndFix' ejecutada y fusionada con éxito.")
+    except Exception as e:
+        print("  [WARNING] Error al intentar aplicar ShareTopology de forma nativa: " + str(e))
+
+    # --------------------------------------------------------------------------
+    # PASO 4: PURGA Y CREACIÓN DE NAMED SELECTIONS SOBRE TOPOLOGÍA VIVA
+    # --------------------------------------------------------------------------
+    print("\n[PASO 4] Purgando grupos y creando Named Selections por tipo de entidad...")
+    
+    purge_all_groups_and_selections(root_part)
+
+    POSITION_TOLERANCE = 1e-3
+    inlet_faces = []
+    outlet_faces = []
+    close_wall_faces = []
+    far_wall_faces = []
+    top_faces = []
+    bottom_faces = []
+    uav_surface_faces = []
+
+    # Clasificación de límites (Caras) en Outer_Domain
+    if outer_domain is not None:
+        for face in outer_domain.Faces:
+            bounds = get_entity_bounds(face, is_face=True)
+            if bounds is None: continue
+            fx_min, fx_max, fy_min, fy_max, fz_min, fz_max = bounds
+
+            if abs(fx_min - outer_box_params["xmin"]) < POSITION_TOLERANCE and abs(fx_max - outer_box_params["xmin"]) < POSITION_TOLERANCE:
+                inlet_faces.append(face)
+            elif abs(fx_min - outer_box_params["xmax"]) < POSITION_TOLERANCE and abs(fx_max - outer_box_params["xmax"]) < POSITION_TOLERANCE:
+                outlet_faces.append(face)
+            elif abs(fy_min - 0.0) < POSITION_TOLERANCE and abs(fy_max - 0.0) < POSITION_TOLERANCE:
+                close_wall_faces.append(face)
+            elif abs(fy_min - outer_box_params["ymax"]) < POSITION_TOLERANCE and abs(fy_max - outer_box_params["ymax"]) < POSITION_TOLERANCE:
+                far_wall_faces.append(face)
+            elif abs(fz_min - outer_box_params["zmin"]) < POSITION_TOLERANCE and abs(fz_max - outer_box_params["zmin"]) < POSITION_TOLERANCE:
+                bottom_faces.append(face)
+            elif abs(fz_min - outer_box_params["zmax"]) < POSITION_TOLERANCE and abs(fz_max - outer_box_params["zmax"]) < POSITION_TOLERANCE:
+                top_faces.append(face)
+
+    # Clasificación de límites (Caras) en Middle_Domain
+    if middle_domain is not None:
+        for face in middle_domain.Faces:
+            bounds = get_entity_bounds(face, is_face=True)
+            if bounds is None: continue
+            fy_min, fy_max = bounds[2], bounds[3]
+            if abs(fy_min - 0.0) < POSITION_TOLERANCE and abs(fy_max - 0.0) < POSITION_TOLERANCE:
+                close_wall_faces.append(face)
+
+    # Clasificación de límites y superficie UAV (Caras) en Inner_Domain
+    if inner_domain is not None:
+        for face in inner_domain.Faces:
+            bounds = get_entity_bounds(face, is_face=True)
+            if bounds is None: continue
+            fx_min, fx_max, fy_min, fy_max, fz_min, fz_max = bounds
+
+            # Plano de simetría (close_wall)
+            if abs(fy_min - 0.0) < POSITION_TOLERANCE and abs(fy_max - 0.0) < POSITION_TOLERANCE:
+                close_wall_faces.append(face)
+                continue
+                
+            # Identificamos si la cara pertenece a los límites externos de la caja interior
+            is_outer_boundary = False
+            if (abs(fx_min - inner_box_params["xmin"]) < POSITION_TOLERANCE and abs(fx_max - inner_box_params["xmin"]) < POSITION_TOLERANCE) or \
+               (abs(fx_min - inner_box_params["xmax"]) < POSITION_TOLERANCE and abs(fx_max - inner_box_params["xmax"]) < POSITION_TOLERANCE) or \
+               (abs(fy_min - inner_box_params["ymax"]) < POSITION_TOLERANCE and abs(fy_max - inner_box_params["ymax"]) < POSITION_TOLERANCE) or \
+               (abs(fz_min - inner_box_params["zmin"]) < POSITION_TOLERANCE and abs(fz_max - inner_box_params["zmin"]) < POSITION_TOLERANCE) or \
+               (abs(fz_min - inner_box_params["zmax"]) < POSITION_TOLERANCE and abs(fz_max - inner_box_params["zmax"]) < POSITION_TOLERANCE):
+                is_outer_boundary = True
+                
+            # Si no es un límite externo, es la huella (cavidad) que dejó el dron restado
+            if not is_outer_boundary:
+                uav_surface_faces.append(face)
+
+    # Instanciación de Named Selections (Caras)
+    create_named_selection_group("inlet", inlet_faces)
+    create_named_selection_group("outlet", outlet_faces)
+    create_named_selection_group("close_wall", close_wall_faces)
+    create_named_selection_group("far_wall", far_wall_faces)
+    create_named_selection_group("top", top_faces)
+    create_named_selection_group("bottom", bottom_faces)
+    create_named_selection_group("uav_surface", uav_surface_faces)
+
+    # Instanciación de Named Selections para Cuerpos de Influencia (Sólidos / Bodies)
+    if inner_domain is not None:
+        create_named_selection_group("inner_boi", [inner_domain])
+    if middle_domain is not None:
+        create_named_selection_group("middle_boi", [middle_domain])
+
+    # --------------------------------------------------------------------------
+    # PASO 5: GUARDADO DUAL (BACKUP .SCDOCX + PRODUCCIÓN .FMD)
+    # --------------------------------------------------------------------------
+    print("\n[PASO 5] Guardando archivos de geometría (Backup .scdocx y Base de Datos .fmd)...")
+    
+    # 1. Guardado de Backup nativo (.scdocx)
+    try:
+        DocumentSave.Execute(SCDOCX_OUTPUT_PATH)
+        print("  [SUCCESS] Backup CAD guardado en: " + str(SCDOCX_OUTPUT_PATH))
+    except Exception as error:
+        print("  [ERROR] Fallo al guardar archivo de backup .scdocx: " + str(error))
+
+    # 2. Exportación a Base de Datos de Fluent Meshing (.fmd)
+    try:
+        DocumentSave.Execute(FMD_OUTPUT_PATH)
+        print("  [SUCCESS] Base de datos .fmd guardada en: " + str(FMD_OUTPUT_PATH))
+    except Exception as error:
+        try:
+            doc = root_part.Document
+            doc.SaveAs(FMD_OUTPUT_PATH)
+            print("  [SUCCESS] Base de datos .fmd guardada mediante doc.SaveAs en: " + str(FMD_OUTPUT_PATH))
+        except Exception as fallback_error:
+            print("  [ERROR] Fallo al exportar archivo .fmd: " + str(fallback_error))
+
+    # 3. Exportación del contrato XML
+    ns_summary = {
+        "inlet": len(inlet_faces),
+        "outlet": len(outlet_faces),
+        "close_wall": len(close_wall_faces),
+        "far_wall": len(far_wall_faces),
+        "top": len(top_faces),
+        "bottom": len(bottom_faces),
+        "uav_surface": len(uav_surface_faces),
+        "inner_boi": 1 if inner_domain else 0,
+        "middle_boi": 1 if middle_domain else 0
+    }
+
+    export_meshing_contract_xml(CONTRACT_XML_PATH, SCDOCX_OUTPUT_PATH, MAC_LENGTH, SEMI_SPAN, ns_summary)
+
+    print("\n==================================================================")
+    print(" [SUCCESS] EXPORTACIÓN DUAL Y REGISTRO XML FINALIZADOS")
+    print("==================================================================")
+
+except Exception as execution_error:
+    print("\n[CRITICAL EXECUTION ERROR]: " + str(execution_error))
